@@ -1,26 +1,106 @@
-name: CI
-on: [push]
+name: Shopify Theme per Branch (Multi-Store)
+
+on:
+  push:
+    branches: ['**/feature/**','**/fix/**','**/chore/**']
+  create:
+    branches: ['**/feature/**','**/fix/**','**/chore/**']
+  delete:
+    branches: ['**/feature/**','**/fix/**','**/chore/**']
+
+permissions:
+  contents: read
+
 jobs:
-  lhci:
-    name: Lighthouse
+  # Figure out which environment (developer) to use from branch prefix
+  derive_env_and_name:
+    if: github.ref_type == 'branch'
     runs-on: ubuntu-latest
+    outputs:
+      env_name: ${{ steps.derive.outputs.env_name }}
+      theme_name: ${{ steps.derive.outputs.theme_name }}
+      is_delete: ${{ steps.derive.outputs.is_delete }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - name: Lighthouse
-        uses: shopify/lighthouse-ci-action@v1
-        with:
-          store: ${{ secrets.SHOP_STORE_OS2 }}
-          password: ${{ secrets.SHOP_PASSWORD_OS2 }}
-          access_token: ${{ secrets.SHOP_ACCESS_TOKEN }}
-          collection_handle: all
-          lhci_github_app_token: ${{ secrets.LHCI_GITHUB_TOKEN }}
-          pull_theme: ${{ secrets.SHOP_PULL_THEME }}
-  theme-check:
-    name: Theme Check
+      - id: derive
+        run: |
+          BRANCH="${{ github.ref_name }}"
+          # env name = text before the first slash, fallback to actor if no slash
+          DEV="${BRANCH%%/*}"
+          if [ -z "$DEV" ] || [ "$DEV" = "$BRANCH" ]; then DEV="${{ github.actor }}"; fi
+          THEME_NAME="${BRANCH//\//-}"
+          # flag if this is a delete event
+          IS_DELETE="false"
+          if [ "${{ github.event_name }}" = "delete" ]; then IS_DELETE="true"; fi
+          echo "env_name=$DEV" >> $GITHUB_OUTPUT
+          echo "theme_name=$THEME_NAME" >> $GITHUB_OUTPUT
+          echo "is_delete=$IS_DELETE" >> $GITHUB_OUTPUT
+
+  # Create/update unpublished theme on pushes/branch creation
+  push_to_store:
+    needs: derive_env_and_name
+    if: needs.derive_env_and_name.outputs.is_delete == 'false'
     runs-on: ubuntu-latest
+    environment: ${{ needs.derive_env_and_name.outputs.env_name }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - name: Theme Check
-        uses: shopify/theme-check-action@v2
+      - uses: actions/checkout@v4
+
+      - name: Install Node & Shopify CLI
+        uses: actions/setup-node@v4
         with:
-          token: ${{ github.token }}
+          node-version: '20'
+      - run: npm i -g @shopify/cli @shopify/theme jq
+
+      - name: Push branch to unpublished theme on the dev store
+        env:
+          SHOPIFY_CLI_AUTH_TOKEN: ${{ secrets.SHOPIFY_CLI_AUTH_TOKEN }}
+          SHOPIFY_FLAG_STORE: ${{ secrets.SHOPIFY_STORE }}
+          THEME_NAME: ${{ needs.derive_env_and_name.outputs.theme_name }}
+        run: |
+          echo "Store: $SHOPIFY_FLAG_STORE"
+          echo "Theme: $THEME_NAME"
+          # Creates if missing; updates if exists; never touches live theme.
+          shopify theme push --unpublished --theme "$THEME_NAME" --allow-live=false
+
+      - name: Summarize theme info
+        env:
+          SHOPIFY_CLI_AUTH_TOKEN: ${{ secrets.SHOPIFY_CLI_AUTH_TOKEN }}
+          SHOPIFY_FLAG_STORE: ${{ secrets.SHOPIFY_STORE }}
+          THEME_NAME: ${{ needs.derive_env_and_name.outputs.theme_name }}
+        run: |
+          THEME_ID=$(shopify theme list --json | jq -r ".themes[] | select(.name==\"$THEME_NAME\") | .id")
+          PREVIEW_URL="https://${SHOPIFY_FLAG_STORE}/?preview_theme_id=${THEME_ID}"
+          {
+            echo "### Theme updated"
+            echo "- **Store**: ${SHOPIFY_FLAG_STORE}"
+            echo "- **Theme**: \`$THEME_NAME\`"
+            echo "- **ID**: \`$THEME_ID\`"
+            echo "- **Preview**: ${PREVIEW_URL}"
+          } >> $GITHUB_STEP_SUMMARY
+
+  # Delete the matching theme when the branch is deleted
+  delete_from_store:
+    needs: derive_env_and_name
+    if: needs.derive_env_and_name.outputs.is_delete == 'true'
+    runs-on: ubuntu-latest
+    environment: ${{ needs.derive_env_and_name.outputs.env_name }}
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm i -g @shopify/cli @shopify/theme jq
+
+      - name: Delete theme in the matching dev store
+        env:
+          SHOPIFY_CLI_AUTH_TOKEN: ${{ secrets.SHOPIFY_CLI_AUTH_TOKEN }}
+          SHOPIFY_FLAG_STORE: ${{ secrets.SHOPIFY_STORE }}
+          THEME_NAME: ${{ needs.derive_env_and_name.outputs.theme_name }}
+        run: |
+          THEME_ID=$(shopify theme list --json | jq -r ".themes[] | select(.name==\"$THEME_NAME\") | .id")
+          if [ -n "$THEME_ID" ] && [ "$THEME_ID" != "null" ]; then
+            echo "Deleting theme $THEME_NAME ($THEME_ID) on ${SHOPIFY_FLAG_STORE}"
+            shopify theme delete --theme "$THEME_ID" --force
+            echo "Deleted theme '$THEME_NAME' ($THEME_ID) on ${SHOPIFY_FLAG_STORE}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "No theme named '$THEME_NAME' found on ${SHOPIFY_FLAG_STORE}" >> $GITHUB_STEP_SUMMARY
+          fi
+
